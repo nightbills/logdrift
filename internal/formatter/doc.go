@@ -23,4 +23,12 @@
 //
 // Unknown keys are silently ignored; the raw line is returned unchanged
 // when it cannot be parsed as JSON.
+//
+// # Options
+//
+// [Options] controls formatting behaviour:
+//
+//   - NoColor     — disable ANSI colour codes (useful when piping output)
+//   - TimeFormat  — Go time layout string applied to the parsed timestamp;
+//     defaults to "15:04:05" when empty
 package formatter
