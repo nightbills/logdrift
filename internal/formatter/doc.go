@@ -13,10 +13,13 @@
 //
 // The formatter recognises the following well-known JSON keys:
 //
-//   - level / level  — log severity (info, warn, error, debug, fatal)
-//   - msg / message  — human-readable message text
-//   - service        — originating service name
-//   - time / ts      — RFC 3339 timestamp
+//   - level / severity — log severity (info, warn, error, debug, fatal)
+//   - msg / message    — human-readable message text
+//   - service          — originating service name
+//   - time / ts        — RFC 3339 timestamp
+//
+// All remaining keys are rendered as key=value pairs appended to the line,
+// sorted alphabetically for consistent output.
 //
 // Unknown keys are silently ignored; the raw line is returned unchanged
 // when it cannot be parsed as JSON.
