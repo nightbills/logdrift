@@ -1,26 +1,23 @@
-// Package snapshot implements a rolling in-memory window of log lines
-// received by logdrift during a live tail session.
+// Package snapshot provides a short-term, time-bounded in-memory store for
+// recently seen log lines. It is used to display a rolling "live snapshot"
+// of activity across all tailed services, giving operators a quick view of
+// what happened in the last N seconds without scrolling back through output.
 //
 // # Overview
 //
-// A [Snapshot] accumulates [Entry] values as lines arrive from one or more
-// tailed files. Entries older than the configured TTL are lazily discarded
-// whenever [Snapshot.Add] or [Snapshot.Entries] is called, keeping memory
-// usage proportional to recent activity rather than total uptime.
+// A Snapshot holds a fixed-size window of log entries, each tagged with the
+// wall-clock time at which it was received. Entries older than the configured
+// TTL are pruned automatically on every write and can also be pruned on demand
+// via Prune. The entire store can be cleared with Reset.
 //
 // # Usage
 //
-//	snap := snapshot.New(30 * time.Second)
-//
-//	// Feed lines from the merged tail channel:
-//	for line := range lines {
-//		snap.Add(line)
+//	s := snapshot.New(30*time.Second, time.Now)
+//	s.Add("service-a", line)
+//	entries := s.Entries()
+//	for _, e := range entries {
+//		fmt.Println(e.Service, e.Line)
 //	}
 //
-//	// Later, replay the window (e.g. on SIGUSR1):
-//	for _, e := range snap.Entries() {
-//		fmt.Println(e.Line)
-//	}
-//
-// A zero TTL retains all entries for the lifetime of the process.
+// Snapshot is safe for concurrent use.
 package snapshot
