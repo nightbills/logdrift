@@ -1,119 +1,179 @@
-// main is the entry point for the logdrift CLI tool.
-// It wires together the tail, filter, and formatter packages
-// to provide real-time structured JSON log viewing.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
-	"github.com/yourorg/logdrift/internal/filter"
-	"github.com/yourorg/logdrift/internal/formatter"
-	"github.com/yourorg/logdrift/internal/tail"
+	"github.com/user/logdrift/internal/colorscheme"
+	"github.com/user/logdrift/internal/dedupe"
+	"github.com/user/logdrift/internal/fieldmask"
+	"github.com/user/logdrift/internal/filter"
+	"github.com/user/logdrift/internal/formatter"
+	"github.com/user/logdrift/internal/highlight"
+	"github.com/user/logdrift/internal/levelfilter"
+	"github.com/user/logdrift/internal/linecount"
+	"github.com/user/logdrift/internal/multiline"
+	"github.com/user/logdrift/internal/output"
+	"github.com/user/logdrift/internal/ratelimit"
+	"github.com/user/logdrift/internal/redact"
+	"github.com/user/logdrift/internal/retag"
+	"github.com/user/logdrift/internal/tail"
+	"github.com/user/logdrift/internal/timerange"
+	"github.com/user/logdrift/internal/truncate"
 )
 
-// config holds the parsed CLI flags.
-type config struct {
-	files   []string
-	level   string
-	service string
-	fields  map[string]string
-	noColor bool
-}
-
 func main() {
-	cfg, err := parseFlags(os.Args[1:])
+	flags := parseFlags()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	out, err := output.New(flags.outputFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "logdrift: output: %v\n", err)
+		os.Exit(1)
+	}
+	defer out.Close()
+
+	scheme := colorscheme.Get(flags.colorScheme)
+	filters, err := filter.Parse(flags.filterExpr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logdrift: filter: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(cfg.files) == 0 {
-		fmt.Fprintln(os.Stderr, "error: at least one log file must be specified")
-		flag.Usage()
-		os.Exit(1)
-	}
+	lf := levelfilter.New(levelfilter.Parse(flags.minLevel))
+	tr, _ := timerange.New(flags.fromTime, flags.toTime)
+	rl := ratelimit.New(flags.rateLimit)
+	defer rl.Stop()
+	dd := dedupe.New(5 * time.Second)
+	defer dd.Stop()
+	rd := redact.New(splitCSV(flags.redactFields), "[REDACTED]")
+	fm := fieldmask.New(splitCSV(flags.includeFields), splitCSV(flags.excludeFields))
+	rt, _ := retag.New(nil)
+	hl := highlight.New(splitCSV(flags.keywords), flags.caseSensitive)
+	trunc := truncate.New(flags.maxWidth)
+	lc := linecount.New()
+	ml := multiline.New(flags.multilineMax, time.Duration(flags.multilineWaitMS)*time.Millisecond, " ")
 
-	// Build filter expressions from flags.
-	var exprs []filter.Expression
-	if cfg.level != "" {
-		exprs = append(exprs, filter.Expression{Field: "level", Value: cfg.level})
-	}
-	if cfg.service != "" {
-		exprs = append(exprs, filter.Expression{Field: "service", Value: cfg.service})
-	}
-	for k, v := range cfg.fields {
-		exprs = append(exprs, filter.Expression{Field: k, Value: v})
-	}
-
-	// Start tailing each file and merge into a single channel.
-	channels := make([]<-chan string, 0, len(cfg.files))
-	for _, path := range cfg.files {
-		ch, err := tail.TailFile(path)
+	var channels []<-chan string
+	for _, path := range flags.files {
+		ch, err := tail.TailFile(ctx, path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error tailing %s: %v\n", path, err)
-			os.Exit(1)
+			fmt.Fprintf(os.Stderr, "logdrift: tail %s: %v\n", path, err)
+			continue
 		}
 		channels = append(channels, ch)
 	}
-
-	merged := tail.MergeLines(channels...)
-
-	fmtOpts := formatter.Options{
-		NoColor: cfg.noColor,
+	if len(channels) == 0 {
+		fmt.Fprintln(os.Stderr, "logdrift: no files to tail")
+		os.Exit(1)
 	}
 
-	for line := range merged {
-		entry, err := filter.Parse(line)
-		if err != nil {
-			// Non-JSON lines are passed through as-is.
-			fmt.Println(line)
-			continue
+	merged := tail.MergeLines(ctx, channels...)
+
+	go func() {
+		for {
+			select {
+			case line, ok := <-merged:
+				if !ok {
+					ml.Flush()
+					return
+				}
+				ml.Feed(line)
+			case <-ctx.Done():
+				ml.Flush()
+				return
+			}
 		}
-		if !filter.Match(entry, exprs) {
-			continue
+	}()
+
+	for {
+		select {
+		case line, ok := <-ml.Out():
+			if !ok {
+				return
+			}
+			if !filter.Match(line, filters) {
+				continue
+			}
+			if !lf.Allow(line) {
+				continue
+			}
+			if tr != nil && !tr.Allow(line) {
+				continue
+			}
+			if dd.IsDuplicate(line) {
+				continue
+			}
+			if !rl.Wait(ctx) {
+				continue
+			}
+			line = rd.Apply(line)
+			line = fm.Apply(line)
+			line = rt.Apply(line)
+			line = formatter.Format(line, scheme)
+			line = hl.Apply(line)
+			line = trunc.Line(line)
+			lc.Inc("default")
+			out.WriteLine(line)
+		case <-ctx.Done():
+			fmt.Fprintf(os.Stderr, "\nlogdrift: %s\n", lc.Summary())
+			return
 		}
-		fmt.Println(formatter.Format(line, fmtOpts))
 	}
 }
 
-// parseFlags parses command-line arguments and returns a config.
-func parseFlags(args []string) (config, error) {
-	fs := flag.NewFlagSet("logdrift", flag.ContinueOnError)
+type flags struct {
+	files           []string
+	filterExpr      string
+	minLevel        string
+	outputFile      string
+	colorScheme     string
+	keywords        string
+	caseSensitive   bool
+	maxWidth        int
+	rateLimit       int
+	redactFields    string
+	includeFields   string
+	excludeFields   string
+	fromTime        string
+	toTime          string
+	multilineMax    int
+	multilineWaitMS int
+}
 
-	level := fs.String("level", "", "filter by log level (e.g. error, warn, info)")
-	service := fs.String("service", "", "filter by service name")
-	rawFields := fs.String("fields", "", "additional field filters as key=value pairs, comma-separated")
-	noColor := fs.Bool("no-color", false, "disable colored output")
+func parseFlags() flags {
+	var f flags
+	flag.StringVar(&f.filterExpr, "filter", "", "filter expression (key=value)")
+	flag.StringVar(&f.minLevel, "level", "debug", "minimum log level")
+	flag.StringVar(&f.outputFile, "out", "", "write output to file")
+	flag.StringVar(&f.colorScheme, "scheme", "default", "color scheme")
+	flag.StringVar(&f.keywords, "highlight", "", "comma-separated keywords to highlight")
+	flag.BoolVar(&f.caseSensitive, "case-sensitive", false, "case-sensitive keyword matching")
+	flag.IntVar(&f.maxWidth, "width", 0, "truncate lines to width (0=off)")
+	flag.IntVar(&f.rateLimit, "rate", 0, "max lines/sec (0=unlimited)")
+	flag.StringVar(&f.redactFields, "redact", "", "comma-separated JSON fields to redact")
+	flag.StringVar(&f.includeFields, "include-fields", "", "comma-separated fields to include")
+	flag.StringVar(&f.excludeFields, "exclude-fields", "", "comma-separated fields to exclude")
+	flag.StringVar(&f.fromTime, "from", "", "start time (RFC3339)")
+	flag.StringVar(&f.toTime, "to", "", "end time (RFC3339)")
+	flag.IntVar(&f.multilineMax, "multiline-max", 50, "max lines per multiline entry (0=unlimited)")
+	flag.IntVar(&f.multilineWaitMS, "multiline-wait", 100, "max wait ms before flushing partial entry")
+	flag.Parse()
+	f.files = flag.Args()
+	return f
+}
 
-	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: logdrift [flags] <file> [file...]")
-		fmt.Fprintln(os.Stderr, "\nFlags:")
-		fs.PrintDefaults()
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
 	}
-
-	if err := fs.Parse(args); err != nil {
-		return config{}, err
-	}
-
-	fields := make(map[string]string)
-	if *rawFields != "" {
-		for _, pair := range strings.Split(*rawFields, ",") {
-			parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
-			if len(parts) != 2 {
-				return config{}, fmt.Errorf("invalid field filter %q: expected key=value", pair)
-			}
-			fields[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
-	}
-
-	return config{
-		files:   fs.Args(),
-		level:   strings.ToLower(*level),
-		service: *service,
-		fields:  fields,
-		noColor: *noColor,
-	}, nil
+	return strings.Split(s, ",")
 }
